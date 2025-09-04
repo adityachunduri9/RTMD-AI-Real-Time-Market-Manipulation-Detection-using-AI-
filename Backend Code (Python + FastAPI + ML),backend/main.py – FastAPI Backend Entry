@@ -1,0 +1,28 @@
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from models.anomaly_detector import detect_anomalies
+from trader_network.graph_analysis import analyze_trader_network
+from utils.sentiment_analysis import analyze_sentiment
+
+app = FastAPI()
+
+# Allow frontend access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/api/anomalies")
+async def get_anomalies():
+    return detect_anomalies()
+
+@app.get("/api/trader-network")
+async def get_trader_network():
+    return analyze_trader_network()
+
+@app.get("/api/sentiment")
+async def get_sentiment():
+    return analyze_sentiment()
