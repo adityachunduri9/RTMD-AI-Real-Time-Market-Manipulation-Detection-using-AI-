@@ -1,0 +1,15 @@
+from textblob import TextBlob
+
+def analyze_sentiment():
+    # Example: Fake social posts about a stock
+    posts = [
+        "This stock is going to the moon!",
+        "Huge gains ahead, everyone buy!",
+        "I’m skeptical about this stock.",
+        "Massive pump incoming."
+    ]
+    results = []
+    for post in posts:
+        score = TextBlob(post).sentiment.polarity
+        results.append({"post": post, "score": score})
+    return results
