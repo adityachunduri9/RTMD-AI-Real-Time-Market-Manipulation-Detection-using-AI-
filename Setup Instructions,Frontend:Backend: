@@ -1,0 +1,17 @@
+Backend :
+cd backend
+pip install -r requirements.txt
+uvicorn main:app --reload
+
+Frontend : 
+cd frontend
+npm install
+npm start
+
+use theese comands to run the code successfully 
+THANK YOU !
+ANY QUERIES CONTACT 
+2210030484cse@gmail.com
+LALITH ADITYA CHOWDARY
+KL-UNIVERSITY-B.TECH
+CYBER SECURITY 
