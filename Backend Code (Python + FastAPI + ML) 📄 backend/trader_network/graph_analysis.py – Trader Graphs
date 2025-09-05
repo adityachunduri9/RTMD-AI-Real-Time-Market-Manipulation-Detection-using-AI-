@@ -1,0 +1,12 @@
+import networkx as nx
+
+def analyze_trader_network():
+    G = nx.Graph()
+    G.add_edges_from([
+        ("TraderA", "TraderB"),
+        ("TraderB", "TraderC"),
+        ("TraderC", "TraderA"),  # Circular pattern
+        ("TraderD", "TraderE"),
+    ])
+    cycles = list(nx.cycle_basis(G))
+    return {"trader_cycles": cycles}
