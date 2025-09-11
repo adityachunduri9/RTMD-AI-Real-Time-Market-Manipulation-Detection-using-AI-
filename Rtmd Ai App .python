@@ -1,0 +1,274 @@
+"""
+RTMD-AI: Single-file Streamlit Prototype (Fixed)
+
+This single-file prototype provides a runnable Streamlit app that simulates trades,
+computes features, runs lightweight anomaly detection (rule-based + IsolationForest),
+and displays results in a dashboard.
+
+***Important fix included in this file:***
+- The original version imported `matplotlib` which caused `ModuleNotFoundError` if
+  `matplotlib` was not installed. This version **removes any dependency on matplotlib**
+  and uses Streamlit's built-in charting, so the app will run without matplotlib.
+
+If you still want to use matplotlib for custom plots, add `matplotlib` to your
+`requirements.txt` and install it (`pip install matplotlib`).
+
+Usage:
+    streamlit run app.py
+
+Dependencies (example `requirements.txt`):
+    pandas
+    numpy
+    scikit-learn
+    streamlit
+
+"""
+
+import time
+import random
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from sklearn.ensemble import IsolationForest
+
+# -----------------------------
+# Configuration
+# -----------------------------
+RET_WIN = 30
+VOL_WIN = 60
+Z_THRESHOLD = 4.0
+VOL_Z_THRESHOLD = 3.5
+TRAIN_INIT = 200
+REFIT_EVERY = 500
+
+# -----------------------------
+# Simulation utilities
+# -----------------------------
+
+def simulate_tick(prev_price: float):
+    """Generate a single synthetic trade tick (price, qty).
+
+    Occasionally injects a pump (price spike + higher qty) to simulate anomalies.
+    """
+    # small multiplicative noise
+    noise = np.random.normal(0, 0.002)
+    price = float(max(0.01, prev_price * (1 + noise)))
+
+    # baseline quantity
+    qty = float(max(1e-6, abs(np.random.normal(0.01, 0.007))))
+
+    # inject a pump with small probability
+    if random.random() < 0.015:
+        # pump: 1% - 6% price jump and volume surge
+        jump = random.uniform(0.01, 0.06)
+        price = price * (1.0 + jump)
+        qty = qty * random.uniform(8, 25)
+
+    # occasional dump
+    if random.random() < 0.005:
+        fall = random.uniform(0.01, 0.04)
+        price = max(0.01, price * (1.0 - fall))
+        qty = qty * random.uniform(3, 10)
+
+    return price, qty
+
+
+# -----------------------------
+# Feature engineering
+# -----------------------------
+
+def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute rolling features and z-scores used for anomaly detection.
+
+    Input df columns: ['ts', 'price', 'qty']
+    Output adds: log_price, log_return, ret_z, vol_z, turnover_z
+    """
+    if df.empty:
+        return df
+
+    out = df.copy()
+    out['log_price'] = np.log(out['price'].clip(lower=1e-8))
+    out['log_return'] = out['log_price'].diff().fillna(0.0)
+
+    # Returns rolling
+    out['ret_mean'] = out['log_return'].rolling(RET_WIN, min_periods=max(3, RET_WIN // 4)).mean()
+    out['ret_std'] = out['log_return'].rolling(RET_WIN, min_periods=max(3, RET_WIN // 4)).std(ddof=0).replace(0, np.nan)
+    out['ret_z'] = (out['log_return'] - out['ret_mean']) / out['ret_std']
+
+    # Volume rolling
+    out['vol_rolling'] = out['qty'].rolling(VOL_WIN, min_periods=max(3, VOL_WIN // 4)).mean()
+    vol_std = out['qty'].rolling(VOL_WIN, min_periods=max(3, VOL_WIN // 4)).std(ddof=0).replace(0, np.nan)
+    out['vol_z'] = (out['qty'] - out['vol_rolling']) / vol_std
+
+    # Turnover
+    out['turnover'] = out['price'] * out['qty']
+    turnover_roll = out['turnover'].rolling(VOL_WIN, min_periods=max(3, VOL_WIN // 4)).mean()
+    turnover_std = out['turnover'].rolling(VOL_WIN, min_periods=max(3, VOL_WIN // 4)).std(ddof=0).replace(0, np.nan)
+    out['turnover_z'] = (out['turnover'] - turnover_roll) / turnover_std
+
+    # Trade rate (approx)
+    out['trade_flag'] = (out['qty'] > 0).astype(int)
+    out['trade_rate'] = out['trade_flag'].rolling(VOL_WIN, min_periods=1).mean()
+
+    out = out.fillna(0.0)
+    return out
+
+
+# -----------------------------
+# Streamlit App
+# -----------------------------
+
+st.set_page_config(page_title="RTMD-AI Prototype", layout="wide")
+st.title("📈 RTMD-AI — Real-Time Market Manipulation Detection (Prototype)")
+
+st.markdown(
+    """
+    **This single-file prototype runs a local simulator and shows live charts & alerts.**
+
+    **Note:** This version **does not require `matplotlib`**. If you received
+    `ModuleNotFoundError: No module named 'matplotlib'` before, that was because
+    the previous file imported matplotlib but the environment didn't have it.
+    """
+)
+
+# Sidebar controls
+with st.sidebar:
+    st.header("Simulation Settings")
+    ticks = st.slider("Number of simulated ticks", min_value=50, max_value=5000, value=800, step=50)
+    refresh = st.slider("Refresh interval (s)", min_value=0.01, max_value=2.0, value=0.3, step=0.01)
+    start = st.button("Start Simulation")
+    reset = st.button("Reset")
+
+# Hold state in session_state
+if 'df' not in st.session_state:
+    st.session_state.df = pd.DataFrame(columns=['ts', 'price', 'qty'])
+if 'alerts' not in st.session_state:
+    st.session_state.alerts = []
+if 'model' not in st.session_state:
+    st.session_state.model = None
+if 'last_model_fit_at' not in st.session_state:
+    st.session_state.last_model_fit_at = 0
+
+# Reset functionality
+if reset:
+    st.session_state.df = pd.DataFrame(columns=['ts', 'price', 'qty'])
+    st.session_state.alerts = []
+    st.session_state.model = None
+    st.session_state.last_model_fit_at = 0
+    st.success("Reset simulator state.")
+
+# Layout placeholders
+col1, col2 = st.columns([2, 1])
+price_chart_ph = col1.empty()
+ind_chart_ph = col1.empty()
+alerts_ph = col2.empty()
+
+# If there's no data yet, seed with a starting price
+if st.session_state.df.empty:
+    seed_price = 100.0
+    ts0 = datetime.utcnow()
+    st.session_state.df = pd.DataFrame([{'ts': ts0, 'price': seed_price, 'qty': 0.01}])
+
+# Run simulation loop when Start pressed
+if start:
+    prev_price = float(st.session_state.df['price'].iloc[-1])
+    pbar = st.progress(0)
+
+    for i in range(ticks):
+        price, qty = simulate_tick(prev_price)
+        ts = datetime.utcnow()
+        new_row = {'ts': ts, 'price': float(price), 'qty': float(qty)}
+        st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([new_row])], ignore_index=True)
+        prev_price = price
+
+        # Compute features
+        df_feat = compute_features(st.session_state.df.copy())
+
+        # Rule-based alert
+        last = df_feat.iloc[-1]
+        if abs(last['ret_z']) >= Z_THRESHOLD and (last['vol_z'] >= VOL_Z_THRESHOLD or last['turnover_z'] >= VOL_Z_THRESHOLD):
+            alert = dict(ts=str(last['ts']), price=float(last['price']), qty=float(last['qty']), kind='RULE_SPIKE',
+                         ret_z=float(last['ret_z']), vol_z=float(last['vol_z']), turnover_z=float(last['turnover_z']))
+            st.session_state.alerts.insert(0, alert)
+
+        # IsolationForest: fit after warm-up and periodically
+        nrows = len(df_feat)
+        if nrows >= TRAIN_INIT and (st.session_state.model is None or (nrows - st.session_state.last_model_fit_at) >= REFIT_EVERY):
+            X = df_feat[['ret_z', 'vol_z', 'turnover_z']].values
+            try:
+                model = IsolationForest(contamination=0.01, random_state=42)
+                model.fit(X)
+                st.session_state.model = model
+                st.session_state.last_model_fit_at = nrows
+            except Exception as e:
+                # if model fails to fit for any reason, skip
+                st.warning(f"IsolationForest fit failed: {e}")
+
+        # If model exists, score current point
+        if st.session_state.model is not None:
+            Xcur = df_feat[['ret_z', 'vol_z', 'turnover_z']].iloc[-1:].values
+            try:
+                score = -float(st.session_state.model.score_samples(Xcur)[0])
+                # heuristic threshold on score
+                if score > 0.2:
+                    alert = dict(ts=str(last['ts']), price=float(last['price']), qty=float(last['qty']), kind='IFOREST', score=float(score),
+                                 ret_z=float(last['ret_z']), vol_z=float(last['vol_z']), turnover_z=float(last['turnover_z']))
+                    st.session_state.alerts.insert(0, alert)
+            except Exception:
+                pass
+
+        # Update progress and charts every few ticks to reduce UI thrash
+        if (i % 3) == 0 or i == ticks - 1:
+            pbar.progress(int((i + 1) / ticks * 100))
+
+            # Price chart (last 500 points)
+            disp = df_feat[['ts', 'price']].copy()
+            disp = disp.tail(500).set_index(pd.to_datetime(disp['ts']))
+            disp = disp.drop(columns=['ts'])
+            price_chart_ph.line_chart(disp['price'])
+
+            # Indicator chart
+            ind = df_feat[['ts', 'ret_z', 'vol_z', 'turnover_z']].copy()
+            ind = ind.tail(500).set_index(pd.to_datetime(ind['ts'])).drop(columns=['ts'])
+            ind_chart_ph.line_chart(ind)
+
+            # Alerts
+            if st.session_state.alerts:
+                alerts_ph.subheader("Recent Alerts")
+                alerts_ph.dataframe(pd.DataFrame(st.session_state.alerts).head(20))
+            else:
+                alerts_ph.info("No alerts yet.")
+
+        # small sleep to simulate time between ticks and allow UI updates
+        time.sleep(refresh)
+
+    pbar.empty()
+    st.success("Simulation finished.")
+
+# Show current stored data and alerts when not running
+else:
+    df_feat = compute_features(st.session_state.df.copy())
+    if not df_feat.empty:
+        disp = df_feat[['ts', 'price']].copy()
+        disp = disp.tail(500).set_index(pd.to_datetime(disp['ts'])).drop(columns=['ts'])
+        price_chart_ph.line_chart(disp['price'])
+
+        ind = df_feat[['ts', 'ret_z', 'vol_z', 'turnover_z']].copy()
+        ind = ind.tail(500).set_index(pd.to_datetime(ind['ts'])).drop(columns=['ts'])
+        ind_chart_ph.line_chart(ind)
+
+    if st.session_state.alerts:
+        alerts_ph.subheader("Recent Alerts")
+        alerts_ph.dataframe(pd.DataFrame(st.session_state.alerts).head(20))
+    else:
+        alerts_ph.info("No alerts yet. Click 'Start Simulation' to generate data.")
+
+# Footer / Troubleshooting
+st.markdown("---")
+st.markdown("**Troubleshooting:** If you see `ModuleNotFoundError` for `matplotlib`, install it with `pip install matplotlib` or remove any imports of matplotlib. This app does not require matplotlib.")
+
+
+# End of file
