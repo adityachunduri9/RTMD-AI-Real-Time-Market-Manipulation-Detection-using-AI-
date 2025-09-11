@@ -1,0 +1,102 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import time
+from sklearn.ensemble import IsolationForest
+import matplotlib.pyplot as plt
+
+# -----------------------------
+# Simulated Trade Data Generator
+# -----------------------------
+def generate_trade_data(n=200):
+    prices = [100]
+    volumes = []
+    for i in range(n):
+        change = np.random.normal(0, 0.2)
+        prices.append(prices[-1] + change)
+        vol = abs(np.random.normal(50, 10))
+        # Inject pump-and-dump anomaly occasionally
+        if np.random.rand() < 0.05:
+            prices[-1] += np.random.normal(5, 2)
+            vol *= 5
+        volumes.append(vol)
+    df = pd.DataFrame({
+        'price': prices[1:],
+        'volume': volumes
+    })
+    return df
+
+# -----------------------------
+# Feature Engineering
+# -----------------------------
+def compute_features(df, window=10):
+    df = df.copy()
+    df['return'] = df['price'].pct_change().fillna(0)
+    df['turnover'] = df['price'] * df['volume']
+    df['ret_z'] = (df['return'] - df['return'].rolling(window).mean()) / df['return'].rolling(window).std()
+    df['vol_z'] = (df['volume'] - df['volume'].rolling(window).mean()) / df['volume'].rolling(window).std()
+    df['turnover_z'] = (df['turnover'] - df['turnover'].rolling(window).mean()) / df['turnover'].rolling(window).std()
+    df = df.fillna(0)
+    return df
+
+# -----------------------------
+# Anomaly Detection
+# -----------------------------
+def detect_anomalies(df):
+    features = df[['ret_z', 'vol_z', 'turnover_z']].values
+    model = IsolationForest(contamination=0.05, random_state=42)
+    preds = model.fit_predict(features)
+    df['anomaly'] = preds
+    return df
+
+# -----------------------------
+# Streamlit Dashboard
+# -----------------------------
+st.set_page_config(page_title="RTMD-AI Prototype", layout="wide")
+st.title("📈 RTMD-AI: Real-Time Market Manipulation Detection (Prototype)")
+
+placeholder = st.empty()
+
+# Live simulation loop
+N = 200
+refresh_rate = 1  # seconds
+
+prices, volumes, alerts = [], [], []
+
+for i in range(N):
+    df = generate_trade_data(n=100)
+    df = compute_features(df)
+    df = detect_anomalies(df)
+
+    # Capture latest anomalies
+    recent_alerts = df[df['anomaly'] == -1].tail(5)
+    for _, row in recent_alerts.iterrows():
+        alerts.append({
+            'price': row['price'],
+            'volume': row['volume'],
+            'ret_z': row['ret_z'],
+            'vol_z': row['vol_z'],
+            'turnover_z': row['turnover_z']
+        })
+
+    with placeholder.container():
+        col1, col2 = st.columns(2)
+
+        # Price Chart
+        with col1:
+            st.subheader("Price Chart")
+            st.line_chart(df['price'])
+
+        # Volume Chart
+        with col2:
+            st.subheader("Volume Chart")
+            st.line_chart(df['volume'])
+
+        # Alerts Table
+        st.subheader("🚨 Recent Anomalies Detected")
+        if alerts:
+            st.dataframe(pd.DataFrame(alerts).tail(10))
+        else:
+            st.write("No anomalies detected yet.")
+
+    time.sleep(refresh_rate)
